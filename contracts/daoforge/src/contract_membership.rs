@@ -1,0 +1,302 @@
+use crate::{MembershipTrait, Daoforge, DaoforgeArgs, DaoforgeClient, DaoforgeTrait, errors, events, types};
+use soroban_sdk::{
+    Address, Bytes, Env, I256, InvokeError, String, Symbol, Vec, contractimpl, panic_with_error,
+    vec,
+};
+
+#[contractimpl]
+impl MembershipTrait for Daoforge {
+    /// Add a new member to the system with metadata.
+    ///
+    /// # Arguments
+    /// * `env` - The environment object
+    /// * `member_address` - The address of the member to add
+    /// * `meta` - Metadata string associated with the member (e.g., IPFS hash)
+    ///
+    /// # Panics
+    /// * If the member already exists
+    fn add_member(env: Env, member_address: Address, meta: String) {
+        Daoforge::require_not_paused(env.clone());
+
+        member_address.require_auth();
+
+        let member_key_ = types::DataKey::Member(member_address.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<types::DataKey, types::Member>(&member_key_)
+            .is_some()
+        {
+            panic_with_error!(&env, &errors::ContractErrors::MemberAlreadyExist)
+        } else {
+            let member = types::Member {
+                projects: Vec::new(&env),
+                meta,
+            };
+            env.storage().persistent().set(&member_key_, &member);
+
+            events::MemberAdded { member_address }.publish(&env);
+        };
+    }
+
+    /// Update the metadata of an existing member.
+    ///
+    /// # Arguments
+    /// * `env` - The environment object
+    /// * `member_address` - The address of the member to update
+    /// * `meta` - New metadata string associated with the member (e.g., IPFS hash)
+    ///
+    /// # Panics
+    /// * If the member doesn't exist
+    fn update_member(env: Env, member_address: Address, meta: String) {
+        Daoforge::require_not_paused(env.clone());
+
+        member_address.require_auth();
+
+        let member_key_ = types::DataKey::Member(member_address.clone());
+        match env
+            .storage()
+            .persistent()
+            .get::<types::DataKey, types::Member>(&member_key_)
+        {
+            None => panic_with_error!(&env, &errors::ContractErrors::UnknownMember),
+            Some(mut member) => {
+                member.meta = meta;
+                env.storage().persistent().set(&member_key_, &member);
+
+                events::MemberAdded { member_address }.publish(&env);
+            }
+        };
+    }
+
+    /// Get member information including all project badges.
+    ///
+    /// # Arguments
+    /// * `env` - The environment object
+    /// * `member_address` - The address of the member to retrieve
+    ///
+    /// # Returns
+    /// * `types::Member` - Member information including metadata and project badges
+    ///
+    /// # Panics
+    /// * If the member doesn't exist
+    fn get_member(env: Env, member_address: Address) -> types::Member {
+        let member_key_ = types::DataKey::Member(member_address.clone());
+        env.storage()
+            .persistent()
+            .get::<types::DataKey, types::Member>(&member_key_)
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, &errors::ContractErrors::UnknownMember);
+            })
+    }
+
+    /// Set badges for a member in a specific project.
+    ///
+    /// This function replaces all existing badges for the member in the specified project
+    /// with the new badge list. The member's maximum voting
+    /// weight is calculated as the sum of all assigned badge weights.
+    ///
+    /// # Arguments
+    /// * `env` - The environment object
+    /// * `maintainer` - The address of the maintainer (must be authorized)
+    /// * `key` - The project key identifier
+    /// * `member` - The address of the member to set badges for
+    /// * `badges` - Vector of badges to assign
+    ///
+    /// # Panics
+    /// * If the maintainer is not authorized
+    /// * If the member doesn't exist
+    /// * If the project doesn't exist
+    fn set_badges(
+        env: Env,
+        maintainer: Address,
+        key: Bytes,
+        member: Address,
+        badges: Vec<types::Badge>,
+    ) {
+        Daoforge::require_not_paused(env.clone());
+
+        crate::auth_maintainers(&env, &maintainer, &key);
+
+        let member_key_ = types::DataKey::Member(member.clone());
+        let mut member_ = if let Some(member_) = env
+            .storage()
+            .persistent()
+            .get::<types::DataKey, types::Member>(&member_key_)
+        {
+            member_
+        } else {
+            panic_with_error!(&env, &errors::ContractErrors::UnknownMember)
+        };
+
+        // For a member, go over its projects and replace all badges for
+        // a project
+        'member_projects_badges: {
+            for i in 0..member_.projects.len() {
+                if let Some(project_badge) = member_.projects.get(i)
+                    && project_badge.project == key
+                {
+                    let mut project_badges = project_badge.clone();
+                    project_badges.badges = badges.clone();
+                    member_.projects.set(i, project_badges);
+                    break 'member_projects_badges;
+                }
+            }
+            let project_badges = types::ProjectBadges {
+                project: key.clone(),
+                badges: badges.clone(),
+            };
+            member_.projects.push_back(project_badges);
+        }
+
+        // For a project, go over all badges and add the specific member if it
+        // has the badge
+        let badges_key_ = types::ProjectKey::Badges(key.clone());
+        let mut badges_ = <Daoforge as MembershipTrait>::get_badges(env.clone(), key.clone());
+
+        for badge_kind in [
+            types::Badge::Developer,
+            types::Badge::Triage,
+            types::Badge::Community,
+            types::Badge::Verified,
+        ] {
+            // Pick the right vector for this badge kind
+            let vec_ref: &mut Vec<Address> = match badge_kind {
+                types::Badge::Developer => &mut badges_.developer,
+                types::Badge::Triage => &mut badges_.triage,
+                types::Badge::Community => &mut badges_.community,
+                types::Badge::Verified => &mut badges_.verified,
+                _ => continue,
+            };
+
+            // Build a cleaned-up copy removing all badges from member
+            let mut new_vec: Vec<Address> = Vec::new(&env);
+            for addr in vec_ref.iter() {
+                if addr != member.clone() {
+                    new_vec.push_back(addr);
+                }
+            }
+            // Add the member back if they should hold this badge now
+            if badges.contains(badge_kind.clone()) {
+                new_vec.push_back(member.clone());
+            }
+            // Replace the old vector
+            *vec_ref = new_vec;
+        }
+
+        env.storage().persistent().set(&badges_key_, &badges_);
+        env.storage().persistent().set(&member_key_, &member_);
+
+        events::BadgesUpdated {
+            project_key: key,
+            maintainer,
+            member,
+            badges_count: badges.len(),
+        }
+        .publish(&env);
+    }
+
+    /// Get all badges for a specific project, organized by badge type.
+    ///
+    /// Returns a structure containing vectors of member addresses for each badge type
+    /// (Developer, Triage, Community, Verified).
+    ///
+    /// # Arguments
+    /// * `env` - The environment object
+    /// * `key` - The project key identifier
+    ///
+    /// # Returns
+    /// * `types::Badges` - Structure containing member addresses for each badge type
+    fn get_badges(env: Env, key: Bytes) -> types::Badges {
+        let badges_key_ = types::ProjectKey::Badges(key);
+        if let Some(badges_) = env
+            .storage()
+            .persistent()
+            .get::<types::ProjectKey, types::Badges>(&badges_key_)
+        {
+            badges_
+        } else {
+            types::Badges {
+                developer: Vec::new(&env),
+                triage: Vec::new(&env),
+                community: Vec::new(&env),
+                verified: Vec::new(&env),
+            }
+        }
+    }
+
+    /// Get the maximum voting weight for an address in a specific project.
+    ///
+    /// Calculates the sum of all badge weights for the address in the project.
+    /// Returns the Default badge weight (1) if the address has no badges
+    /// assigned or is not a registered member.
+    ///
+    /// There is a special case to use Neural Quorum Governance instead of
+    /// badges if we are using a specific project.
+    ///
+    /// # Arguments
+    /// * `env` - The environment object
+    /// * `project_key` - The project key identifier
+    /// * `member_address` - The address to check
+    ///
+    /// # Returns
+    /// * `u32` - The maximum voting weight for the address
+    fn get_max_weight(env: Env, project_key: Bytes, member_address: Address) -> u32 {
+        let member_key = types::DataKey::Member(member_address.clone());
+
+        // special case to use Neural Quorum Governance
+        let key = env
+            .storage()
+            .instance()
+            .get(&types::DataKey::NqgProjectKey)
+            .expect("NQG project key exists");
+        if project_key == key {
+            return get_nqg(&env, member_address);
+        }
+
+        if let Some(member) = env
+            .storage()
+            .persistent()
+            .get::<types::DataKey, types::Member>(&member_key)
+        {
+            match member
+                .projects
+                .iter()
+                .find(|project_badges| project_badges.project == project_key)
+            {
+                Some(project_badges) => {
+                    if project_badges.badges.is_empty() {
+                        types::Badge::Default as u32
+                    } else {
+                        project_badges
+                            .badges
+                            .iter()
+                            .map(|badge| badge as u32)
+                            .sum::<u32>()
+                    }
+                }
+                _ => types::Badge::Default as u32,
+            }
+        } else {
+            types::Badge::Default as u32
+        }
+    }
+}
+
+fn get_nqg(e: &Env, user: Address) -> u32 {
+    let nqg_contract_address = crate::retrieve_contract(e, types::ContractKey::Nqg);
+
+    let r = e.try_invoke_contract::<I256, InvokeError>(
+        &nqg_contract_address.address,
+        &Symbol::new(e, "get_voting_power_for_user"),
+        vec![e, user.to_string().to_val()],
+    );
+    let nqg: I256 = match r {
+        Ok(Ok(v)) => v,
+        _ => I256::from_i128(e, 0),
+    };
+    let scaled = nqg.div(&I256::from_i128(e, 10_i128.pow(12)));
+    let nqg = scaled.to_i128().unwrap() as u32;
+    // limit to pilots who have at least 4M
+    if nqg > 4_000_000 { nqg } else { 0 }
+}

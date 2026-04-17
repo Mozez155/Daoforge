@@ -1,0 +1,128 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import Container from "../../components/layout/Container.astro";
+import ProjectInfo from "../../components/page/project/ProjectInfo.astro";
+import ProjectInfoTitle from "../../components/page/project/ProjectInfoTitle.astro";
+---
+
+<script is:inline>
+  var global = global || window;
+</script>
+
+<Layout title="Daoforge" page="project">
+  <Container>
+    <ProjectInfoTitle />
+    <ProjectInfo />
+  </Container>
+</Layout>
+
+<script>
+  import {
+    fetchTomlFromIpfs,
+    fetchTextFromIpfs,
+  } from "../../utils/ipfsFunctions";
+  import {
+    getProjectFromName,
+    getProjectHash,
+  } from "../../service/ReadContractService";
+  import {
+    refreshLocalStorage,
+    setConfigData,
+    setProject,
+    setProjectId,
+    setProjectLatestSha,
+    setProjectRepoInfo,
+  } from "../../service/StateService";
+  import { getAuthorRepo } from "../../utils/editLinkFunctions";
+  import { projectHasSubProjects, projectInfoLoaded } from "../../utils/store";
+  import { extractConfigData, toast } from "../../utils/utils";
+
+  document.addEventListener("astro:page-load", async () => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const projectName = urlParams.get("name") || "";
+    if (!projectName) {
+      window.location.href = "/";
+      return;
+    }
+    projectHasSubProjects.set(false);
+    {
+      setProjectId(projectName);
+      try {
+        const project = await getProjectFromName(projectName);
+        if (project && project.name && project.config && project.maintainers) {
+          setProject(project);
+
+          (async () => {
+            const [tomlResult, hashResult] = await Promise.allSettled([
+              fetchTomlFromIpfs(project.config.ipfs),
+              getProjectHash(),
+            ]);
+
+            let configData: any = extractConfigData({}, project);
+            if (tomlResult.status === "fulfilled" && tomlResult.value) {
+              configData = extractConfigData(tomlResult.value, project);
+            }
+
+            // For non-software projects, fetch README from IPFS
+            if (configData.projectType !== "SOFTWARE" && project.config.ipfs) {
+              try {
+                const readme = await fetchTextFromIpfs(
+                  project.config.ipfs,
+                  "/README.md",
+                );
+                // README must come from /README.md file ONLY
+                configData = {
+                  ...configData,
+                  readmeContent:
+                    readme || "No README available for this project.",
+                };
+              } catch (e) {
+                console.error("Failed to fetch README.md:", e);
+                configData = {
+                  ...configData,
+                  readmeContent: "No README available for this project.",
+                };
+              }
+            }
+
+            setConfigData(configData);
+            projectInfoLoaded.set(true);
+
+            // Only set GitHub repo info for SOFTWARE projects
+            const isSoftwareProject = configData.projectType === "SOFTWARE";
+            if (isSoftwareProject) {
+              const { username, repoName } = getAuthorRepo(project.config.url);
+              if (username && repoName) {
+                setProjectRepoInfo(username, repoName);
+              }
+
+              const sha =
+                hashResult.status === "fulfilled" ? hashResult.value : null;
+              setProjectLatestSha(
+                sha && typeof sha === "string" && /^[a-f0-9]{40}$/.test(sha)
+                  ? sha
+                  : "",
+              );
+              if (hashResult.status === "rejected") {
+                toast.error(
+                  "Something Went Wrong!",
+                  hashResult.reason?.message,
+                );
+              }
+            }
+          })();
+        } else {
+          refreshLocalStorage();
+          window.location.href = "/";
+        }
+      } catch (error: any) {
+        if (import.meta.env.DEV) {
+          console.error("Error fetching project info:", error);
+        }
+        toast.error("Something Went Wrong!", error.message);
+        refreshLocalStorage();
+        window.location.href = "/";
+      }
+    }
+  });
+</script>
