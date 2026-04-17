@@ -83,17 +83,17 @@ The full list of open issues is in [`ISSUES.md`](./ISSUES.md). These are real, w
 
 ```
 daoforge/
-├── contracts/          # Rust/Soroban smart contracts
+├── smartcontract/      # Rust/Soroban smart contracts
 │   ├── daoforge/       # Core governance + versioning contract
 │   └── scf-membership/ # Badge-based membership contract
-├── dapp/               # Astro + React frontend
+├── frontend/           # Astro + React dapp
 │   └── src/            # Components, services, utilities
-├── daoforge/           # Python event streaming backend
+├── backend/            # Python event streaming backend
 │   └── src/            # FastAPI app, DB models, event ingestion
 └── daoforge.toml       # Project configuration
 ```
 
-The smart contracts are the source of truth. The dapp and backend are interfaces to them — replaceable, forkable, and independently deployable.
+Each directory is independently deployable. The smart contracts are the source of truth — the frontend and backend are interfaces to them, replaceable and forkable.
 
 ---
 
